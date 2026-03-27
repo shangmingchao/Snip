@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Snip</string>
+    <string name="crop">Crop</string>
+    <string name="ratio_width">Width</string>
+    <string name="ratio_height">Height</string>
+    <string name="ratio_divider">:</string>
+    <string name="close">close</string>
+    <string name="rotate">rotate</string>
+    <string name="reset">reset</string>
+</resources>

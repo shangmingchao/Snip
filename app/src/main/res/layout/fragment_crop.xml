@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:background="@color/black">
+
+    <ImageView
+        android:id="@+id/close"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="@string/close"
+        android:padding="14dp"
+        android:src="@drawable/ic_close_white_28"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <ImageView
+        android:id="@+id/rotate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="@string/rotate"
+        android:padding="14dp"
+        android:src="@drawable/ic_counter_clockwise_white_28"
+        app:layout_constraintEnd_toStartOf="@id/confirm"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <ImageView
+        android:id="@+id/confirm"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="@string/rotate"
+        android:padding="16dp"
+        android:src="@drawable/ic_crop_confirm"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
+        android:id="@+id/reset"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minWidth="60dp"
+        android:minHeight="40dp"
+        android:gravity="center"
+        android:textSize="14sp"
+        android:textColor="@color/white"
+        android:text="@string/reset"
+        app:layout_constraintEnd_toStartOf="@id/rotate"
+        app:layout_constraintTop_toTopOf="@id/rotate"
+        app:layout_constraintBottom_toBottomOf="@id/rotate"/>
+
+    <cn.frank.snip.CropImageView
+        android:id="@+id/cropImageView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/close" />
+</androidx.constraintlayout.widget.ConstraintLayout>
