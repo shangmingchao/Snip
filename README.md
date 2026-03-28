@@ -1,6 +1,6 @@
 # Snip
 
-[![Snip](./screenshot/snap.gif)
+![Snip](./screenshot/snap.gif)
 
 **Snip** 是一个轻量级、流畅的 Android 图片裁剪库，采用 `Matrix` 实现，提供丰富的交互体验。支持固定/自由比例裁剪、手势拖拽缩放、旋转、边界回弹等特性，帮助您快速集成图片裁剪功能。
 
