@@ -39,7 +39,7 @@ android {
 }
 
 dependencies {
-    implementation(project(":snip"))
+    implementation(libs.snip)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.core.ktx)
