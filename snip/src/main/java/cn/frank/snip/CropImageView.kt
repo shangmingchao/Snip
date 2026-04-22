@@ -22,12 +22,17 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
+import kotlin.math.abs
+import kotlin.math.sqrt
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.withMatrix
+import androidx.core.graphics.withSave
 
 /**
  * 图片裁剪 View
  *
  * 功能特性：
- * - 多种裁剪比例：1:1、16:9、9:16、4:3、3:4、自由比例
+ * - 任意裁剪比例，包括：1:1、16:9、9:16、4:3、3:4、自由比例
  * - 单指拖动图片
  * - 双指缩放图片
  * - 双击放大（最多5次）
@@ -37,7 +42,7 @@ import android.view.animation.OvershootInterpolator
  * - Matrix 实现，流畅动画
  * - 边界回弹动画
  * - 三分线网格（触摸时显示）
- * - 图片旋转功能（逆时针/顺时针 90 度，带动画）
+ * - 图片旋转功能
  *
  * @author shangmingchao
  */
@@ -47,15 +52,31 @@ class CropImageView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // ==================== 边缘/角类型 ====================
-    private enum class EdgeType {
-        NONE,
-        TOP, BOTTOM, LEFT, RIGHT,
-        TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT
+    // ==================== 边缘/角类型（位标志） ====================
+    private enum class EdgeType(val flags: Int) {
+        NONE(0),
+        TOP(FLAG_TOP),
+        BOTTOM(FLAG_BOTTOM),
+        LEFT(FLAG_LEFT),
+        RIGHT(FLAG_RIGHT),
+        TOP_LEFT(FLAG_TOP or FLAG_LEFT),
+        TOP_RIGHT(FLAG_TOP or FLAG_RIGHT),
+        BOTTOM_LEFT(FLAG_BOTTOM or FLAG_LEFT),
+        BOTTOM_RIGHT(FLAG_BOTTOM or FLAG_RIGHT);
+
+        val movesTop: Boolean get() = flags and FLAG_TOP != 0
+        val movesBottom: Boolean get() = flags and FLAG_BOTTOM != 0
+        val movesLeft: Boolean get() = flags and FLAG_LEFT != 0
+        val movesRight: Boolean get() = flags and FLAG_RIGHT != 0
     }
 
     // ==================== 常量配置 ====================
     companion object {
+        private const val FLAG_TOP = 1
+        private const val FLAG_BOTTOM = 2
+        private const val FLAG_LEFT = 4
+        private const val FLAG_RIGHT = 8
+
         private const val CROP_BOX_SIZE_RATIO = 0.8f
         private const val MAX_SCALE_LEVELS = 5
         private const val SCALE_FACTOR = 1.5f
@@ -74,8 +95,6 @@ class CropImageView @JvmOverloads constructor(
     private val imageMatrix = Matrix()
     private val savedMatrix = Matrix()
     private val matrixValues = FloatArray(9)
-
-    // 图片边界
     private val imageRect = RectF()
 
     // 裁剪框
@@ -91,14 +110,8 @@ class CropImageView @JvmOverloads constructor(
     private val gestureDetector: GestureDetector
     private var activePointerId = -1
     private val lastTouch = PointF()
-
-    // 当前缩放级别
     private var currentScaleLevel = 0
-
-    // 缩放时锁定的焦点（避免缩放过程中焦点变化导致跳动）
     private val lockedFocus = PointF()
-
-    // 自定义缩放手势检测
     private var isScaling = false
     private var lastSpan = 0f
 
@@ -109,7 +122,7 @@ class CropImageView @JvmOverloads constructor(
     private val edgeTouchPoint = PointF()
 
     // ==================== 旋转相关 ====================
-    private var currentRotation = 0 // 当前旋转角度 (0, 90, 180, 270)
+    private var currentRotation = 0
 
     // ==================== 动画相关 ====================
     private var bounceAnimator: ValueAnimator? = null
@@ -150,11 +163,13 @@ class CropImageView @JvmOverloads constructor(
         gestureDetector = GestureDetector(context, GestureListener())
     }
 
+    // ==================== 公共 API ====================
+
     /**
-     * 设置图片
+     * 设置图片位图
      */
     fun setImageBitmap(bitmap: Bitmap?) {
-        this.sourceBitmap = bitmap
+        sourceBitmap = bitmap
         bitmap?.let {
             resetMatrix()
             calculateCropRect()
@@ -167,102 +182,48 @@ class CropImageView @JvmOverloads constructor(
      * 设置裁剪比例
      */
     fun setCropRatio(ratio: Float) {
-        if (this.currentRatio != ratio) {
-            this.currentRatio = ratio
+        if (currentRatio != ratio) {
+            currentRatio = ratio
             calculateCropRect()
             fitImageToCrop()
             invalidate()
         }
     }
 
-    // ==================== 旋转功能 ====================
-
     /**
-     * 逆时针旋转图片 90 度，带动画
+     * 旋转
      */
-    fun rotate() {
-        if (sourceBitmap == null) return
-        animateRotate(-90f)
+    fun rotate(degrees: Float) {
+        if (sourceBitmap != null) animateRotate(degrees)
     }
 
     /**
-     * 顺时针旋转图片 90 度，带动画
+     * 获取裁剪后的图片
      */
-    fun rotateClockwise() {
-        if (sourceBitmap == null) return
-        animateRotate(90f)
-    }
+    fun getCroppedImage(): Bitmap? {
+        val bitmap = sourceBitmap ?: return null
+        val cropWidth = cropRect.width().toInt()
+        val cropHeight = cropRect.height().toInt()
+        if (cropWidth <= 0 || cropHeight <= 0) return null
 
-    /**
-     * 执行旋转动画
-     * 以裁剪框中心为锚点旋转，保持当前缩放比例
-     */
-    private fun animateRotate(degrees: Float) {
-        cancelAnimations()
-
-        // 更新旋转角度
-        currentRotation = (currentRotation + degrees.toInt() + 360) % 360
-
-        // 以裁剪框中心为旋转锚点
-        val centerX = cropRect.centerX()
-        val centerY = cropRect.centerY()
-
-        // 保存当前矩阵状态用于动画
-        savedMatrix.set(imageMatrix)
-
-        rotateAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 300
-            interpolator = decelerateInterpolator
-
-            addUpdateListener { animation ->
-                val fraction = animation.animatedFraction
-                val currentDegrees = degrees * fraction
-
-                imageMatrix.set(savedMatrix)
-                imageMatrix.postRotate(currentDegrees, centerX, centerY)
-                postInvalidateOnAnimation()
+        return createBitmap(cropWidth, cropHeight).also { result ->
+            Canvas(result).apply {
+                translate(-cropRect.left, -cropRect.top)
+                concat(imageMatrix)
+                drawBitmap(bitmap, 0f, 0f, null)
             }
-
-            addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) {
-                    // 确保裁剪框不超出图片边界
-                    ensureCropWithinBounds()
-                    invalidate()
-                }
-            })
-        }.also { it.start() }
-    }
-
-    /**
-     * 确保裁剪框在图片边界内
-     */
-    private fun ensureCropWithinBounds() {
-        val bitmap = sourceBitmap ?: return
-        calculateImageRect()
-
-        // 获取旋转后的图片尺寸
-        val (rotatedWidth, rotatedHeight) = getRotatedBitmapSize(bitmap)
-
-        // 检查缩放是否足够
-        val currentScale = getCurrentScale()
-        val minScale = maxOf(
-            cropRect.width() / rotatedWidth,
-            cropRect.height() / rotatedHeight
-        )
-
-        if (currentScale < minScale) {
-            // 需要放大
-            val scale = minScale / currentScale
-            imageMatrix.postScale(scale, scale, cropRect.centerX(), cropRect.centerY())
-            calculateImageRect()
         }
-
-        // 修正边界
-        fixTranslateBounds()
-        calculateImageRect()
     }
 
-    // ==================== 核心计算方法 ====================
+    fun reset() {
+        currentScaleLevel = 0
+        currentRotation = 0
+        calculateCropRect()
+        fitImageToCrop()
+        invalidate()
+    }
+
+    // ==================== 矩阵与裁剪框计算 ====================
 
     private fun resetMatrix() {
         imageMatrix.reset()
@@ -275,112 +236,85 @@ class CropImageView @JvmOverloads constructor(
         val viewHeight = height
         if (viewWidth <= 0 || viewHeight <= 0) return
 
-        val maxCropWidth = viewWidth * CROP_BOX_SIZE_RATIO
-        val maxCropHeight = viewHeight * CROP_BOX_SIZE_RATIO
+        val maxW = viewWidth * CROP_BOX_SIZE_RATIO
+        val maxH = viewHeight * CROP_BOX_SIZE_RATIO
 
         val (cropWidth, cropHeight) = if (currentRatio > 0) {
-            // 固定比例模式
-            if (currentRatio >= 1f) {
-                var ch = maxCropWidth / currentRatio
-                if (ch > maxCropHeight) {
-                    ch = maxCropHeight
-                    maxCropWidth * ch / (maxCropWidth / currentRatio) to ch
-                } else {
-                    maxCropWidth to ch
-                }
-            } else {
-                var cw = maxCropHeight * currentRatio
-                if (cw > maxCropWidth) {
-                    cw = maxCropWidth
-                    cw to cw / currentRatio
-                } else {
-                    cw to maxCropHeight
-                }
-            }
+            calculateFixedSizeRatio(maxW, maxH, currentRatio)
         } else {
-            // 自由比例模式：裁剪框大小为图片大小（旋转后）
             sourceBitmap?.let { bitmap ->
-                val (bmpWidth, bmpHeight) = getRotatedBitmapSize(bitmap)
-                // 限制在视图范围内
-                val scale = minOf(maxCropWidth / bmpWidth, maxCropHeight / bmpHeight, 1f)
-                bmpWidth * scale to bmpHeight * scale
+                val (bmpW, bmpH) = getRotatedBitmapSize(bitmap)
+                val scale = minOf(maxW / bmpW, maxH / bmpH, 1f)
+                bmpW * scale to bmpH * scale
             } ?: run {
-                // 没有图片时使用正方形
-                val size = maxCropWidth.coerceAtMost(maxCropHeight)
+                val size = maxW.coerceAtMost(maxH)
                 size to size
             }
         }
 
         val left = (viewWidth - cropWidth) / 2f
         val top = (viewHeight - cropHeight) / 2f
-
         cropRect.set(left, top, left + cropWidth, top + cropHeight)
         originalCropRect.set(cropRect)
     }
 
+    /**
+     * 在给定最大区域内，计算指定比例的裁剪框尺寸
+     */
+    private fun calculateFixedSizeRatio(maxW: Float, maxH: Float, ratio: Float): Pair<Float, Float> {
+        return if (ratio >= 1f) {
+            val h = (maxW / ratio).coerceAtMost(maxH)
+            h * ratio to h
+        } else {
+            val w = (maxH * ratio).coerceAtMost(maxW)
+            w to w / ratio
+        }
+    }
+
     private fun calculateImageRect() {
         sourceBitmap?.let { bitmap ->
-            // 始终使用原始图片尺寸，让矩阵处理所有变换
             imageRect.set(0f, 0f, bitmap.width.toFloat(), bitmap.height.toFloat())
             imageMatrix.mapRect(imageRect)
         }
     }
 
-    /**
-     * 获取旋转后的图片尺寸（仅用于计算缩放比例）
-     */
     private fun getRotatedBitmapSize(bitmap: Bitmap): Pair<Float, Float> {
-        val width = bitmap.width.toFloat()
-        val height = bitmap.height.toFloat()
-        return when (currentRotation) {
-            90, 270 -> height to width  // 旋转90度或270度时，宽高互换
-            else -> width to height
+        val w = bitmap.width.toFloat()
+        val h = bitmap.height.toFloat()
+        return if (currentRotation == 90 || currentRotation == 270) h to w else w to h
+    }
+
+    /**
+     * 构建适配裁剪框的变换矩阵（缩放 → 旋转 → 平移居中）
+     */
+    private fun buildFitMatrix(bitmap: Bitmap, targetRect: RectF = cropRect): Matrix {
+        val (bmpW, bmpH) = getRotatedBitmapSize(bitmap)
+        val scale = maxOf(targetRect.width() / bmpW, targetRect.height() / bmpH)
+
+        return Matrix().apply {
+            postScale(scale, scale)
+            if (currentRotation != 0) {
+                postRotate(currentRotation.toFloat(), bitmap.width * scale / 2, bitmap.height * scale / 2)
+            }
+            val mapped = RectF(0f, 0f, bitmap.width.toFloat(), bitmap.height.toFloat())
+            mapRect(mapped)
+            postTranslate(targetRect.centerX() - mapped.centerX(), targetRect.centerY() - mapped.centerY())
         }
     }
 
     private fun fitImageToCrop() {
         val bitmap = sourceBitmap ?: return
         if (width <= 0 || height <= 0) return
-
-        // 根据旋转角度确定图片尺寸
-        val (bmpWidth, bmpHeight) = getRotatedBitmapSize(bitmap)
-
-        val cropWidth = cropRect.width()
-        val cropHeight = cropRect.height()
-
-        val scaleX = cropWidth / bmpWidth
-        val scaleY = cropHeight / bmpHeight
-        val scale = maxOf(scaleX, scaleY)
-
-        imageMatrix.reset()
-
-        // 1. 先缩放
-        imageMatrix.postScale(scale, scale)
-
-        // 2. 如果有旋转，应用旋转（以缩放后的图片中心为旋转中心）
-        if (currentRotation != 0) {
-            val scaledWidth = bitmap.width * scale
-            val scaledHeight = bitmap.height * scale
-            imageMatrix.postRotate(currentRotation.toFloat(), scaledWidth / 2, scaledHeight / 2)
-        }
-
-        // 3. 计算需要的平移
-        calculateImageRect()
-        val dx = cropRect.centerX() - imageRect.centerX()
-        val dy = cropRect.centerY() - imageRect.centerY()
-        imageMatrix.postTranslate(dx, dy)
-
+        imageMatrix.set(buildFitMatrix(bitmap))
         currentScaleLevel = 0
         calculateImageRect()
     }
 
     private fun getCurrentScale(): Float {
         imageMatrix.getValues(matrixValues)
-        // 当矩阵包含旋转时，需要计算实际的缩放比例
-        // scale = sqrt(MSCALE_X^2 + MSKEW_Y^2)
         val scaleX = matrixValues[Matrix.MSCALE_X]
         val skewY = matrixValues[Matrix.MSKEW_Y]
-        return kotlin.math.sqrt(scaleX * scaleX + skewY * skewY)
+        return sqrt(scaleX * scaleX + skewY * skewY)
     }
 
     private fun getCurrentTranslate(): PointF {
@@ -388,7 +322,76 @@ class CropImageView @JvmOverloads constructor(
         return PointF(matrixValues[Matrix.MTRANS_X], matrixValues[Matrix.MTRANS_Y])
     }
 
-    // ==================== 手势监听器 ====================
+    private fun getMinScale(): Float {
+        val bitmap = sourceBitmap ?: return 1f
+        val (bmpW, bmpH) = getRotatedBitmapSize(bitmap)
+        return maxOf(cropRect.width() / bmpW, cropRect.height() / bmpH)
+    }
+
+    /**
+     * 计算图片边界修正偏移量
+     */
+    private fun calculateBoundsOffset(): Pair<Float, Float> {
+        calculateImageRect()
+        val dx = when {
+            imageRect.width() >= cropRect.width() -> when {
+                imageRect.left > cropRect.left -> cropRect.left - imageRect.left
+                imageRect.right < cropRect.right -> cropRect.right - imageRect.right
+                else -> 0f
+            }
+            else -> cropRect.centerX() - imageRect.centerX()
+        }
+        val dy = when {
+            imageRect.height() >= cropRect.height() -> when {
+                imageRect.top > cropRect.top -> cropRect.top - imageRect.top
+                imageRect.bottom < cropRect.bottom -> cropRect.bottom - imageRect.bottom
+                else -> 0f
+            }
+            else -> cropRect.centerY() - imageRect.centerY()
+        }
+        return dx to dy
+    }
+
+    // ==================== 旋转功能 ====================
+
+    private fun animateRotate(degrees: Float) {
+        cancelAnimations()
+        currentRotation = (currentRotation + degrees.toInt() + 360) % 360
+
+        val centerX = cropRect.centerX()
+        val centerY = cropRect.centerY()
+        savedMatrix.set(imageMatrix)
+
+        rotateAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            interpolator = decelerateInterpolator
+            addUpdateListener { animation ->
+                imageMatrix.set(savedMatrix)
+                imageMatrix.postRotate(degrees * animation.animatedFraction, centerX, centerY)
+                postInvalidateOnAnimation()
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    ensureCropWithinBounds()
+                    invalidate()
+                }
+            })
+        }.also { it.start() }
+    }
+
+    private fun ensureCropWithinBounds() {
+        calculateImageRect()
+        val currentScale = getCurrentScale()
+        val minScale = getMinScale()
+        if (currentScale < minScale) {
+            val scale = minScale / currentScale
+            imageMatrix.postScale(scale, scale, cropRect.centerX(), cropRect.centerY())
+        }
+        fixTranslateBounds()
+        calculateImageRect()
+    }
+
+    // ==================== 手势监听 ====================
 
     private inner class GestureListener : GestureDetector.SimpleOnGestureListener() {
         override fun onDoubleTap(e: MotionEvent): Boolean {
@@ -407,37 +410,29 @@ class CropImageView @JvmOverloads constructor(
             animateFitToCrop()
             return
         }
-
-        val currentScale = getCurrentScale()
-        var targetScale = currentScale * SCALE_FACTOR
-        targetScale = targetScale.coerceAtMost(MAX_SCALE)
-
+        val targetScale = (getCurrentScale() * SCALE_FACTOR).coerceAtMost(MAX_SCALE)
         animateZoom(focusX, focusY, targetScale)
     }
+
+    // ==================== 动画方法 ====================
 
     private fun animateZoom(focusX: Float, focusY: Float, targetScale: Float) {
         val startScale = getCurrentScale()
         savedMatrix.set(imageMatrix)
-
         cancelAnimations()
 
         bounceAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 300
             interpolator = overshootInterpolator
-
             addUpdateListener { animation ->
                 val fraction = animation.animatedFraction
-                val currentScaleValue = startScale + (targetScale - startScale) * fraction
-
+                val scaleValue = startScale + (targetScale - startScale) * fraction
                 imageMatrix.set(savedMatrix)
-                val scaleStep = currentScaleValue / startScale
-                imageMatrix.postScale(scaleStep, scaleStep, focusX, focusY)
-
+                imageMatrix.postScale(scaleValue / startScale, scaleValue / startScale, focusX, focusY)
                 calculateImageRect()
                 checkAndFixBounds()
                 postInvalidateOnAnimation()
             }
-
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
                     calculateImageRect()
@@ -450,35 +445,7 @@ class CropImageView @JvmOverloads constructor(
     private fun animateFitToCrop() {
         val bitmap = sourceBitmap ?: return
         savedMatrix.set(imageMatrix)
-
-        val targetMatrix = Matrix()
-        // 使用旋转后的图片尺寸
-        val (bmpWidth, bmpHeight) = getRotatedBitmapSize(bitmap)
-        val cropWidth = cropRect.width()
-        val cropHeight = cropRect.height()
-
-        val scaleX = cropWidth / bmpWidth
-        val scaleY = cropHeight / bmpHeight
-        val scale = maxOf(scaleX, scaleY)
-
-        // 1. 先缩放
-        targetMatrix.postScale(scale, scale)
-
-        // 2. 如果有旋转，应用旋转（以缩放后的图片中心为旋转中心）
-        if (currentRotation != 0) {
-            val scaledWidth = bitmap.width * scale
-            val scaledHeight = bitmap.height * scale
-            targetMatrix.postRotate(currentRotation.toFloat(), scaledWidth / 2, scaledHeight / 2)
-        }
-
-        // 3. 计算平移
-        val tempRect = RectF(0f, 0f, bitmap.width.toFloat(), bitmap.height.toFloat())
-        targetMatrix.mapRect(tempRect)
-
-        val dx = cropRect.centerX() - tempRect.centerX()
-        val dy = cropRect.centerY() - tempRect.centerY()
-        targetMatrix.postTranslate(dx, dy)
-
+        val targetMatrix = buildFitMatrix(bitmap)
         cancelAnimations()
 
         val startValues = FloatArray(9)
@@ -489,7 +456,6 @@ class CropImageView @JvmOverloads constructor(
         bounceAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 400
             interpolator = decelerateInterpolator
-
             addUpdateListener { animation ->
                 val fraction = animation.animatedFraction
                 for (i in 0..8) {
@@ -499,7 +465,6 @@ class CropImageView @JvmOverloads constructor(
                 calculateImageRect()
                 postInvalidateOnAnimation()
             }
-
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
                     currentScaleLevel = 0
@@ -509,21 +474,134 @@ class CropImageView @JvmOverloads constructor(
         }.also { it.start() }
     }
 
+    private fun animateRestoreCropRect() {
+        val bitmap = sourceBitmap ?: return
+        calculateImageRect()
+
+        val currentScale = getCurrentScale()
+        val currentTranslate = getCurrentTranslate()
+        val imageCenterX = (cropRect.centerX() - currentTranslate.x) / currentScale
+        val imageCenterY = (cropRect.centerY() - currentTranslate.y) / currentScale
+
+        val targetCropRect = if (currentRatio > 0) {
+            RectF(originalCropRect)
+        } else {
+            val aspectRatio = cropRect.width() / cropRect.height()
+            val maxCropWidth = width * CROP_BOX_SIZE_RATIO
+            val maxCropHeight = height * CROP_BOX_SIZE_RATIO
+            val (tw, th) = calculateFixedSizeRatio(maxCropWidth, maxCropHeight, aspectRatio)
+            RectF((width - tw) / 2, (height - th) / 2, (width + tw) / 2, (height + th) / 2)
+        }
+
+        val scale = maxOf(targetCropRect.width() / cropRect.width(), targetCropRect.height() / cropRect.height())
+        val targetScale = currentScale * scale
+        val targetTranslateX = targetCropRect.centerX() - imageCenterX * targetScale
+        val targetTranslateY = targetCropRect.centerY() - imageCenterY * targetScale
+
+        cancelAnimations()
+
+        val startCropRect = RectF(cropRect)
+        savedMatrix.set(imageMatrix)
+
+        restoreAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            interpolator = decelerateInterpolator
+            addUpdateListener { animation ->
+                val f = animation.animatedFraction
+
+                cropRect.left = startCropRect.left + (targetCropRect.left - startCropRect.left) * f
+                cropRect.top = startCropRect.top + (targetCropRect.top - startCropRect.top) * f
+                cropRect.right = startCropRect.right + (targetCropRect.right - startCropRect.right) * f
+                cropRect.bottom = startCropRect.bottom + (targetCropRect.bottom - startCropRect.bottom) * f
+
+                val animScale = currentScale + (targetScale - currentScale) * f
+                val animTx = currentTranslate.x + (targetTranslateX - currentTranslate.x) * f
+                val animTy = currentTranslate.y + (targetTranslateY - currentTranslate.y) * f
+
+                imageMatrix.reset()
+                imageMatrix.postScale(animScale, animScale)
+                if (currentRotation != 0) {
+                    imageMatrix.postRotate(
+                        currentRotation.toFloat(),
+                        bitmap.width * animScale / 2,
+                        bitmap.height * animScale / 2
+                    )
+                }
+                imageMatrix.postTranslate(animTx, animTy)
+                calculateImageRect()
+                postInvalidateOnAnimation()
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    cropRect.set(if (currentRatio > 0) originalCropRect else targetCropRect)
+                    calculateImageRect()
+                    checkAndFixBounds()
+                }
+            })
+        }.also { it.start() }
+    }
+
+    private fun animateBounce(dx: Float, dy: Float) {
+        cancelAnimations()
+        savedMatrix.set(imageMatrix)
+
+        bounceAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 250
+            interpolator = decelerateInterpolator
+            addUpdateListener { animation ->
+                val f = animation.animatedFraction
+                imageMatrix.set(savedMatrix)
+                imageMatrix.postTranslate(dx * f, dy * f)
+                calculateImageRect()
+                postInvalidateOnAnimation()
+            }
+        }.also { it.start() }
+    }
+
     private fun cancelAnimations() {
         bounceAnimator?.cancel()
         restoreAnimator?.cancel()
         rotateAnimator?.cancel()
     }
 
-    // ==================== 触摸事件处理 ====================
+    // ==================== 边界检查 ====================
+
+    private fun checkAndFixBounds() {
+        calculateImageRect()
+        val currentScale = getCurrentScale()
+        val minScale = getMinScale()
+        if (currentScale < minScale) {
+            val scale = minScale / currentScale
+            imageMatrix.postScale(scale, scale, cropRect.centerX(), cropRect.centerY())
+        }
+        fixTranslateBounds()
+    }
+
+    private fun fixTranslateBounds() {
+        val (dx, dy) = calculateBoundsOffset()
+        if (dx != 0f || dy != 0f) {
+            imageMatrix.postTranslate(dx, dy)
+            calculateImageRect()
+        }
+    }
+
+    private fun animateCheckBounds() {
+        if (sourceBitmap == null) return
+        calculateImageRect()
+        if (getCurrentScale() < getMinScale()) {
+            animateFitToCrop()
+            return
+        }
+        val (dx, dy) = calculateBoundsOffset()
+        if (dx != 0f || dy != 0f) animateBounce(dx, dy) else postInvalidate()
+    }
+
+    // ==================== 触摸事件 ====================
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (sourceBitmap == null) return false
-
-        // 先让手势检测器处理双击事件
         gestureDetector.onTouchEvent(event)
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> handleActionDown(event)
             MotionEvent.ACTION_POINTER_DOWN -> handleActionPointerDown(event)
@@ -532,25 +610,19 @@ class CropImageView @JvmOverloads constructor(
             MotionEvent.ACTION_UP -> handleActionUp()
             MotionEvent.ACTION_CANCEL -> handleActionCancel()
         }
-
         return true
     }
 
     private fun handleActionDown(event: MotionEvent) {
         activePointerId = event.getPointerId(0)
         lastTouch.set(event.x, event.y)
-
-        // 只要有手指触摸屏幕就展示网格线
         isShowingGuideLines = true
 
         activeEdge = detectEdgeTouch(event.x, event.y)
-
-        if (activeEdge != EdgeType.NONE) {
-            isDraggingEdge = true
+        isDraggingEdge = activeEdge != EdgeType.NONE
+        if (isDraggingEdge) {
             tempCropRect.set(cropRect)
             originalCropRect.set(cropRect)
-        } else {
-            isDraggingEdge = false
         }
 
         edgeTouchPoint.set(event.x, event.y)
@@ -558,467 +630,159 @@ class CropImageView @JvmOverloads constructor(
     }
 
     private fun handleActionPointerDown(event: MotionEvent) {
-        // 多指触摸时也保持网格线显示
-        if (isDraggingEdge) {
-            isDraggingEdge = false
-        }
+        isDraggingEdge = false
         isShowingGuideLines = true
-        // 开始自定义缩放检测
         if (event.pointerCount == 2) {
             isScaling = true
             lastSpan = calculateSpan(event)
-            // 锁定焦点为两指中点
-            lockedFocus.set(
-                (event.getX(0) + event.getX(1)) / 2f,
-                (event.getY(0) + event.getY(1)) / 2f
-            )
+            updateLockedFocus(event)
         }
     }
 
     private fun handleActionMove(event: MotionEvent) {
-        // 自定义缩放检测
-        if (isScaling && event.pointerCount >= 2) {
-            handleCustomScale(event)
-            return
-        }
-
-        if (isDraggingEdge) {
-            handleEdgeDrag(event)
-        } else {
-            handleImageDrag(event)
+        when {
+            isScaling && event.pointerCount >= 2 -> handleCustomScale(event)
+            isDraggingEdge -> handleEdgeDrag(event)
+            else -> handleImageDrag(event)
         }
     }
 
-    /**
-     * 自定义缩放处理
-     */
     private fun handleCustomScale(event: MotionEvent) {
         val currentSpan = calculateSpan(event)
-
-        // 手指间距太小，跳过缩放
         if (currentSpan < MIN_POINTER_SPAN || lastSpan < MIN_POINTER_SPAN) {
             lastSpan = currentSpan
             return
         }
-
-        // 计算缩放比例
         val scaleFactor = currentSpan / lastSpan
         lastSpan = currentSpan
+        updateLockedFocus(event)
 
-        // 更新锁定焦点位置
+        imageMatrix.postScale(scaleFactor, scaleFactor, lockedFocus.x, lockedFocus.y)
+        calculateImageRect()
+        postInvalidateOnAnimation()
+    }
+
+    private fun calculateSpan(event: MotionEvent): Float {
+        if (event.pointerCount < 2) return 0f
+        val dx = event.getX(0) - event.getX(1)
+        val dy = event.getY(0) - event.getY(1)
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    private fun updateLockedFocus(event: MotionEvent) {
         if (event.pointerCount >= 2) {
             lockedFocus.set(
                 (event.getX(0) + event.getX(1)) / 2f,
                 (event.getY(0) + event.getY(1)) / 2f
             )
         }
-
-        // 应用缩放
-        imageMatrix.postScale(scaleFactor, scaleFactor, lockedFocus.x, lockedFocus.y)
-        calculateImageRect()
-        postInvalidateOnAnimation()
-    }
-
-    /**
-     * 计算两指间距
-     */
-    private fun calculateSpan(event: MotionEvent): Float {
-        if (event.pointerCount < 2) return 0f
-        val dx = event.getX(0) - event.getX(1)
-        val dy = event.getY(0) - event.getY(1)
-        return kotlin.math.sqrt(dx * dx + dy * dy)
     }
 
     private fun handleEdgeDrag(event: MotionEvent) {
         val dx = event.x - edgeTouchPoint.x
         val dy = event.y - edgeTouchPoint.y
-
         tempCropRect.set(originalCropRect)
 
-        when (activeEdge) {
-            EdgeType.TOP -> adjustTop(dy)
-            EdgeType.BOTTOM -> adjustBottom(dy)
-            EdgeType.LEFT -> adjustLeft(dx)
-            EdgeType.RIGHT -> adjustRight(dx)
-            EdgeType.TOP_LEFT -> adjustTopLeft(dx, dy)
-            EdgeType.TOP_RIGHT -> adjustTopRight(dx, dy)
-            EdgeType.BOTTOM_LEFT -> adjustBottomLeft(dx, dy)
-            EdgeType.BOTTOM_RIGHT -> adjustBottomRight(dx, dy)
-            else -> {}
-        }
+        // 应用拖动
+        if (activeEdge.movesLeft) tempCropRect.left += dx
+        if (activeEdge.movesRight) tempCropRect.right += dx
+        if (activeEdge.movesTop) tempCropRect.top += dy
+        if (activeEdge.movesBottom) tempCropRect.bottom += dy
+
+        // 约束
+        if (currentRatio > 0) constrainRatio(dx, dy) else constrainMinSize()
 
         cropRect.set(tempCropRect)
         postInvalidateOnAnimation()
     }
 
     /**
-     * 计算固定比例下的最小宽度和最小高度
-     * 确保宽高都至少为 MIN_CROP_SIZE
+     * 固定比例约束：根据主方向计算等比尺寸，锚定对边/对角
      */
+    private fun constrainRatio(dx: Float, dy: Float) {
+        val edge = activeEdge
+        val isHorizontal = edge.movesLeft || edge.movesRight
+        val isVertical = edge.movesTop || edge.movesBottom
+
+        // 确定主方向（角调整时根据拖动幅度判断）
+        val dominantH = isHorizontal && (!isVertical || abs(dx) > abs(dy))
+
+        var newWidth: Float
+        var newHeight: Float
+        if (dominantH) {
+            newWidth = tempCropRect.width()
+            newHeight = newWidth / currentRatio
+        } else {
+            newHeight = tempCropRect.height()
+            newWidth = newHeight * currentRatio
+        }
+
+        // 最小尺寸检查
+        val (minWidth, minHeight) = getMinSizeForRatio()
+        if (newWidth < minWidth || newHeight < minHeight) {
+            newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
+            newHeight = newWidth / currentRatio
+        }
+
+        // 垂直方向：移动的边锚定对边，未移动的边锚定中心
+        if (edge.movesTop && !edge.movesBottom) {
+            tempCropRect.top = tempCropRect.bottom - newHeight
+        } else if (edge.movesBottom && !edge.movesTop) {
+            tempCropRect.bottom = tempCropRect.top + newHeight
+        } else {
+            val cy = tempCropRect.centerY()
+            tempCropRect.top = cy - newHeight / 2
+            tempCropRect.bottom = cy + newHeight / 2
+        }
+
+        // 水平方向：同理
+        if (edge.movesLeft && !edge.movesRight) {
+            tempCropRect.left = tempCropRect.right - newWidth
+        } else if (edge.movesRight && !edge.movesLeft) {
+            tempCropRect.right = tempCropRect.left + newWidth
+        } else {
+            val cx = tempCropRect.centerX()
+            tempCropRect.left = cx - newWidth / 2
+            tempCropRect.right = cx + newWidth / 2
+        }
+    }
+
+    /**
+     * 自由比例约束：确保最小尺寸
+     */
+    private fun constrainMinSize() {
+        val edge = activeEdge
+        if (edge.movesLeft && tempCropRect.width() < MIN_CROP_SIZE) {
+            tempCropRect.left = tempCropRect.right - MIN_CROP_SIZE
+        }
+        if (edge.movesRight && tempCropRect.width() < MIN_CROP_SIZE) {
+            tempCropRect.right = tempCropRect.left + MIN_CROP_SIZE
+        }
+        if (edge.movesTop && tempCropRect.height() < MIN_CROP_SIZE) {
+            tempCropRect.top = tempCropRect.bottom - MIN_CROP_SIZE
+        }
+        if (edge.movesBottom && tempCropRect.height() < MIN_CROP_SIZE) {
+            tempCropRect.bottom = tempCropRect.top + MIN_CROP_SIZE
+        }
+    }
+
     private fun getMinSizeForRatio(): Pair<Float, Float> {
         return if (currentRatio > 0) {
-            if (currentRatio >= 1f) {
-                // 宽度大于高度，以高度为基准
-                MIN_CROP_SIZE to MIN_CROP_SIZE * currentRatio
-            } else {
-                // 高度大于宽度，以宽度为基准
-                MIN_CROP_SIZE / currentRatio to MIN_CROP_SIZE
-            }
+            if (currentRatio >= 1f) MIN_CROP_SIZE to MIN_CROP_SIZE * currentRatio
+            else MIN_CROP_SIZE / currentRatio to MIN_CROP_SIZE
         } else {
             MIN_CROP_SIZE to MIN_CROP_SIZE
-        }
-    }
-
-    /**
-     * 调整顶部边 - 以底边为锚点进行等比例缩放
-     */
-    private fun adjustTop(dy: Float) {
-        if (currentRatio > 0) {
-            // 固定比例：以底边为锚点，根据 dy 计算新的高度和宽度
-
-            // 先保存原来的中心X坐标
-            val centerX = tempCropRect.centerX()
-            val bottom = tempCropRect.bottom
-
-            // 计算新的高度（向上拖动 dy 为负值，高度增加）
-            var newHeight = bottom - (tempCropRect.top + dy)
-            var newWidth = newHeight * currentRatio
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以底边为锚点，调整顶边和左右边
-            tempCropRect.bottom = bottom
-            tempCropRect.top = bottom - newHeight
-            tempCropRect.left = centerX - newWidth / 2
-            tempCropRect.right = centerX + newWidth / 2
-        } else {
-            // 自由比例：只调整顶部
-            var newTop = tempCropRect.top + dy
-            // 检查最小高度
-            if (tempCropRect.bottom - newTop < MIN_CROP_SIZE) {
-                newTop = tempCropRect.bottom - MIN_CROP_SIZE
-            }
-            tempCropRect.top = newTop
-        }
-    }
-
-    /**
-     * 调整底部边 - 以顶边为锚点进行等比例缩放
-     */
-    private fun adjustBottom(dy: Float) {
-        if (currentRatio > 0) {
-            // 固定比例：以顶边为锚点，根据 dy 计算新的高度和宽度
-
-            // 先保存原来的中心X坐标
-            val centerX = tempCropRect.centerX()
-            val top = tempCropRect.top
-
-            // 计算新的高度
-            var newHeight = (tempCropRect.bottom + dy) - top
-            var newWidth = newHeight * currentRatio
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以顶边为锚点，调整底边和左右边
-            tempCropRect.top = top
-            tempCropRect.bottom = top + newHeight
-            tempCropRect.left = centerX - newWidth / 2
-            tempCropRect.right = centerX + newWidth / 2
-        } else {
-            // 自由比例：只调整底部
-            var newBottom = tempCropRect.bottom + dy
-            // 检查最小高度
-            if (newBottom - tempCropRect.top < MIN_CROP_SIZE) {
-                newBottom = tempCropRect.top + MIN_CROP_SIZE
-            }
-            tempCropRect.bottom = newBottom
-        }
-    }
-
-    /**
-     * 调整左边 - 以右边为锚点进行等比例缩放
-     */
-    private fun adjustLeft(dx: Float) {
-        if (currentRatio > 0) {
-            // 固定比例：以右边为锚点，根据 dx 计算新的宽度和高度
-
-            // 先保存原来的中心Y坐标
-            val centerY = tempCropRect.centerY()
-            val right = tempCropRect.right
-
-            // 计算新的宽度（向左拖动 dx 为负值，宽度增加）
-            var newWidth = right - (tempCropRect.left + dx)
-            var newHeight = newWidth / currentRatio
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以右边为锚点，调整左边和上下边
-            tempCropRect.right = right
-            tempCropRect.left = right - newWidth
-            tempCropRect.top = centerY - newHeight / 2
-            tempCropRect.bottom = centerY + newHeight / 2
-        } else {
-            // 自由比例：只调整左侧
-            var newLeft = tempCropRect.left + dx
-            // 检查最小宽度
-            if (tempCropRect.right - newLeft < MIN_CROP_SIZE) {
-                newLeft = tempCropRect.right - MIN_CROP_SIZE
-            }
-            tempCropRect.left = newLeft
-        }
-    }
-
-    /**
-     * 调整右边 - 以左边为锚点进行等比例缩放
-     */
-    private fun adjustRight(dx: Float) {
-        if (currentRatio > 0) {
-            // 固定比例：以左边为锚点，根据 dx 计算新的宽度和高度
-
-            // 先保存原来的中心Y坐标
-            val centerY = tempCropRect.centerY()
-            val left = tempCropRect.left
-
-            // 计算新的宽度
-            var newWidth = (tempCropRect.right + dx) - left
-            var newHeight = newWidth / currentRatio
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以左边为锚点，调整右边和上下边
-            tempCropRect.left = left
-            tempCropRect.right = left + newWidth
-            tempCropRect.top = centerY - newHeight / 2
-            tempCropRect.bottom = centerY + newHeight / 2
-        } else {
-            // 自由比例：只调整右侧
-            var newRight = tempCropRect.right + dx
-            // 检查最小宽度
-            if (newRight - tempCropRect.left < MIN_CROP_SIZE) {
-                newRight = tempCropRect.left + MIN_CROP_SIZE
-            }
-            tempCropRect.right = newRight
-        }
-    }
-
-    /**
-     * 调整左上角 - 以右下角为锚点进行等比例缩放
-     */
-    private fun adjustTopLeft(dx: Float, dy: Float) {
-        if (currentRatio > 0) {
-
-            // 根据拖动方向决定以哪个方向为主
-            var newWidth: Float
-            var newHeight: Float
-
-            if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
-                // 以水平方向为主
-                newWidth = tempCropRect.right - (tempCropRect.left + dx)
-                newHeight = newWidth / currentRatio
-            } else {
-                // 以垂直方向为主
-                newHeight = tempCropRect.bottom - (tempCropRect.top + dy)
-                newWidth = newHeight * currentRatio
-            }
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以右下角为锚点，调整左上角
-            tempCropRect.left = tempCropRect.right - newWidth
-            tempCropRect.top = tempCropRect.bottom - newHeight
-        } else {
-            // 自由比例：分别调整左和上
-            var newLeft = tempCropRect.left + dx
-            var newTop = tempCropRect.top + dy
-
-            // 检查最小尺寸
-            if (tempCropRect.right - newLeft < MIN_CROP_SIZE) {
-                newLeft = tempCropRect.right - MIN_CROP_SIZE
-            }
-            if (tempCropRect.bottom - newTop < MIN_CROP_SIZE) {
-                newTop = tempCropRect.bottom - MIN_CROP_SIZE
-            }
-
-            tempCropRect.left = newLeft
-            tempCropRect.top = newTop
-        }
-    }
-
-    /**
-     * 调整右上角 - 以左下角为锚点进行等比例缩放
-     */
-    private fun adjustTopRight(dx: Float, dy: Float) {
-        if (currentRatio > 0) {
-
-            var newWidth: Float
-            var newHeight: Float
-
-            if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
-                // 以水平方向为主
-                newWidth = (tempCropRect.right + dx) - tempCropRect.left
-                newHeight = newWidth / currentRatio
-            } else {
-                // 以垂直方向为主
-                newHeight = tempCropRect.bottom - (tempCropRect.top + dy)
-                newWidth = newHeight * currentRatio
-            }
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以左下角为锚点，调整右上角
-            tempCropRect.right = tempCropRect.left + newWidth
-            tempCropRect.top = tempCropRect.bottom - newHeight
-        } else {
-            // 自由比例
-            var newRight = tempCropRect.right + dx
-            var newTop = tempCropRect.top + dy
-
-            if (newRight - tempCropRect.left < MIN_CROP_SIZE) {
-                newRight = tempCropRect.left + MIN_CROP_SIZE
-            }
-            if (tempCropRect.bottom - newTop < MIN_CROP_SIZE) {
-                newTop = tempCropRect.bottom - MIN_CROP_SIZE
-            }
-
-            tempCropRect.right = newRight
-            tempCropRect.top = newTop
-        }
-    }
-
-    /**
-     * 调整左下角 - 以右上角为锚点进行等比例缩放
-     */
-    private fun adjustBottomLeft(dx: Float, dy: Float) {
-        if (currentRatio > 0) {
-
-            var newWidth: Float
-            var newHeight: Float
-
-            if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
-                // 以水平方向为主
-                newWidth = tempCropRect.right - (tempCropRect.left + dx)
-                newHeight = newWidth / currentRatio
-            } else {
-                // 以垂直方向为主
-                newHeight = (tempCropRect.bottom + dy) - tempCropRect.top
-                newWidth = newHeight * currentRatio
-            }
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以右上角为锚点，调整左下角
-            tempCropRect.left = tempCropRect.right - newWidth
-            tempCropRect.bottom = tempCropRect.top + newHeight
-        } else {
-            // 自由比例
-            var newLeft = tempCropRect.left + dx
-            var newBottom = tempCropRect.bottom + dy
-
-            if (tempCropRect.right - newLeft < MIN_CROP_SIZE) {
-                newLeft = tempCropRect.right - MIN_CROP_SIZE
-            }
-            if (newBottom - tempCropRect.top < MIN_CROP_SIZE) {
-                newBottom = tempCropRect.top + MIN_CROP_SIZE
-            }
-
-            tempCropRect.left = newLeft
-            tempCropRect.bottom = newBottom
-        }
-    }
-
-    /**
-     * 调整右下角 - 以左上角为锚点进行等比例缩放
-     */
-    private fun adjustBottomRight(dx: Float, dy: Float) {
-        if (currentRatio > 0) {
-
-            var newWidth: Float
-            var newHeight: Float
-
-            if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
-                // 以水平方向为主
-                newWidth = (tempCropRect.right + dx) - tempCropRect.left
-                newHeight = newWidth / currentRatio
-            } else {
-                // 以垂直方向为主
-                newHeight = (tempCropRect.bottom + dy) - tempCropRect.top
-                newWidth = newHeight * currentRatio
-            }
-
-            // 检查最小尺寸
-            val (minWidth, minHeight) = getMinSizeForRatio()
-            if (newWidth < minWidth || newHeight < minHeight) {
-                newWidth = minWidth.coerceAtLeast(minHeight * currentRatio)
-                newHeight = newWidth / currentRatio
-            }
-
-            // 以左上角为锚点，调整右下角
-            tempCropRect.right = tempCropRect.left + newWidth
-            tempCropRect.bottom = tempCropRect.top + newHeight
-        } else {
-            // 自由比例
-            var newRight = tempCropRect.right + dx
-            var newBottom = tempCropRect.bottom + dy
-
-            if (newRight - tempCropRect.left < MIN_CROP_SIZE) {
-                newRight = tempCropRect.left + MIN_CROP_SIZE
-            }
-            if (newBottom - tempCropRect.top < MIN_CROP_SIZE) {
-                newBottom = tempCropRect.top + MIN_CROP_SIZE
-            }
-
-            tempCropRect.right = newRight
-            tempCropRect.bottom = newBottom
         }
     }
 
     private fun handleImageDrag(event: MotionEvent) {
         val pointerIndex = event.findPointerIndex(activePointerId)
         if (pointerIndex < 0) return
-
         val x = event.getX(pointerIndex)
         val y = event.getY(pointerIndex)
-        val dx = x - lastTouch.x
-        val dy = y - lastTouch.y
-
-        imageMatrix.postTranslate(dx, dy)
-        calculateImageRect()
+        imageMatrix.postTranslate(x - lastTouch.x, y - lastTouch.y)
         lastTouch.set(x, y)
+        calculateImageRect()
         postInvalidateOnAnimation()
     }
 
@@ -1026,48 +790,26 @@ class CropImageView @JvmOverloads constructor(
         val pointerIndex = event.actionIndex
         val pointerId = event.getPointerId(pointerIndex)
 
-        // 结束缩放
         if (event.pointerCount <= 2) {
             isScaling = false
             lastSpan = 0f
         }
         isShowingGuideLines = false
-        // 如果抬起的是当前活动手指，切换到另一个手指
-        if (pointerId == activePointerId) {
-            // 找到另一个仍然按下的手指
-            val newPointerIndex = if (pointerIndex == 0) 1 else 0
-            // 确保新索引有效（指针数量足够）
-            if (event.pointerCount > newPointerIndex) {
-                activePointerId = event.getPointerId(newPointerIndex)
-                lastTouch.set(event.getX(newPointerIndex), event.getY(newPointerIndex))
-            }
-        }
 
-        // 抬起后剩余的手指数量
-        val remainingPointers = event.pointerCount - 1
-        if (remainingPointers >= 1) {
-            // 还有手指在屏幕上，更新到剩余手指的位置
-            val remainingIndex = if (pointerIndex == 0) 1 else 0
-            if (event.pointerCount > remainingIndex) {
-                lastTouch.set(event.getX(remainingIndex), event.getY(remainingIndex))
+        val otherIndex = if (pointerIndex == 0) 1 else 0
+        if (event.pointerCount > otherIndex) {
+            if (pointerId == activePointerId) {
+                activePointerId = event.getPointerId(otherIndex)
             }
+            lastTouch.set(event.getX(otherIndex), event.getY(otherIndex))
         }
     }
 
     private fun handleActionUp() {
-        // 结束缩放
         isScaling = false
         lastSpan = 0f
-
-        // 所有手指离开屏幕时隐藏网格线
         isShowingGuideLines = false
-
-        if (isDraggingEdge) {
-            animateRestoreCropRect()
-        } else {
-            animateCheckBounds()
-        }
-
+        if (isDraggingEdge) animateRestoreCropRect() else animateCheckBounds()
         activePointerId = -1
         isDraggingEdge = false
         activeEdge = EdgeType.NONE
@@ -1083,392 +825,86 @@ class CropImageView @JvmOverloads constructor(
     }
 
     private fun detectEdgeTouch(x: Float, y: Float): EdgeType {
-        val threshold = EDGE_TOUCH_THRESHOLD
-
-        val nearTop = kotlin.math.abs(y - cropRect.top) < threshold
-        val nearBottom = kotlin.math.abs(y - cropRect.bottom) < threshold
-        val nearLeft = kotlin.math.abs(x - cropRect.left) < threshold
-        val nearRight = kotlin.math.abs(x - cropRect.right) < threshold
-
-        val inHorizontalRange = x >= cropRect.left - threshold && x <= cropRect.right + threshold
-        val inVerticalRange = y >= cropRect.top - threshold && y <= cropRect.bottom + threshold
+        val t = EDGE_TOUCH_THRESHOLD
+        val nearTop = abs(y - cropRect.top) < t
+        val nearBottom = abs(y - cropRect.bottom) < t
+        val nearLeft = abs(x - cropRect.left) < t
+        val nearRight = abs(x - cropRect.right) < t
+        val inH = x >= cropRect.left - t && x <= cropRect.right + t
+        val inV = y >= cropRect.top - t && y <= cropRect.bottom + t
+        val inCropH = x >= cropRect.left && x <= cropRect.right
+        val inCropV = y >= cropRect.top && y <= cropRect.bottom
 
         return when {
-            nearTop && nearLeft && inHorizontalRange && inVerticalRange -> EdgeType.TOP_LEFT
-            nearTop && nearRight && inHorizontalRange && inVerticalRange -> EdgeType.TOP_RIGHT
-            nearBottom && nearLeft && inHorizontalRange && inVerticalRange -> EdgeType.BOTTOM_LEFT
-            nearBottom && nearRight && inHorizontalRange && inVerticalRange -> EdgeType.BOTTOM_RIGHT
-            nearTop && inHorizontalRange && x >= cropRect.left && x <= cropRect.right -> EdgeType.TOP
-            nearBottom && inHorizontalRange && x >= cropRect.left && x <= cropRect.right -> EdgeType.BOTTOM
-            nearLeft && inVerticalRange && y >= cropRect.top && y <= cropRect.bottom -> EdgeType.LEFT
-            nearRight && inVerticalRange && y >= cropRect.top && y <= cropRect.bottom -> EdgeType.RIGHT
+            nearTop && nearLeft && inH && inV -> EdgeType.TOP_LEFT
+            nearTop && nearRight && inH && inV -> EdgeType.TOP_RIGHT
+            nearBottom && nearLeft && inH && inV -> EdgeType.BOTTOM_LEFT
+            nearBottom && nearRight && inH && inV -> EdgeType.BOTTOM_RIGHT
+            nearTop && inH && inCropH -> EdgeType.TOP
+            nearBottom && inH && inCropH -> EdgeType.BOTTOM
+            nearLeft && inV && inCropV -> EdgeType.LEFT
+            nearRight && inV && inCropV -> EdgeType.RIGHT
             else -> EdgeType.NONE
         }
     }
 
-    private fun animateRestoreCropRect() {
-        val bitmap = sourceBitmap ?: return
-        calculateImageRect()
-
-        // 当前裁剪框中心对应的图片区域
-        val cropCenterX = cropRect.centerX()
-        val cropCenterY = cropRect.centerY()
-
-        val currentScale = getCurrentScale()
-        val currentTranslate = getCurrentTranslate()
-
-        // 裁剪框中心在图片坐标系中的位置
-        val imageCenterX = (cropCenterX - currentTranslate.x) / currentScale
-        val imageCenterY = (cropCenterY - currentTranslate.y) / currentScale
-
-        // 计算目标裁剪框
-        val targetCropRect = if (currentRatio > 0) {
-            // 固定比例：还原到原始裁剪框
-            RectF(originalCropRect)
-        } else {
-            // 自由比例：保持当前裁剪框的宽高比，居中，不超过视图 80%
-            val cropAspectRatio = cropRect.width() / cropRect.height()
-
-            // 视图允许的最大裁剪框尺寸
-            val maxCropWidth = width * CROP_BOX_SIZE_RATIO
-            val maxCropHeight = height * CROP_BOX_SIZE_RATIO
-
-            // 计算目标裁剪框大小，保持比例且不超过最大尺寸
-            val targetRect = RectF()
-            if (cropAspectRatio >= maxCropWidth / maxCropHeight) {
-                // 裁剪框较宽，以最大宽度为准
-                val targetWidth = maxCropWidth
-                val targetHeight = targetWidth / cropAspectRatio
-                targetRect.left = (width - targetWidth) / 2
-                targetRect.top = (height - targetHeight) / 2
-                targetRect.right = targetRect.left + targetWidth
-                targetRect.bottom = targetRect.top + targetHeight
-            } else {
-                // 裁剪框较高，以最大高度为准
-                val targetHeight = maxCropHeight
-                val targetWidth = targetHeight * cropAspectRatio
-                targetRect.left = (width - targetWidth) / 2
-                targetRect.top = (height - targetHeight) / 2
-                targetRect.right = targetRect.left + targetWidth
-                targetRect.bottom = targetRect.top + targetHeight
-            }
-            targetRect
-        }
-
-        // 计算需要的缩放比例
-        val scaleX = targetCropRect.width() / cropRect.width()
-        val scaleY = targetCropRect.height() / cropRect.height()
-        val scale = maxOf(scaleX, scaleY)
-
-        // 目标缩放值
-        val targetScale = currentScale * scale
-
-        // 目标平移值
-        val targetTranslateX = targetCropRect.centerX() - imageCenterX * targetScale
-        val targetTranslateY = targetCropRect.centerY() - imageCenterY * targetScale
-
-        cancelAnimations()
-
-        val startCropRect = RectF(cropRect)
-        val endCropRect = targetCropRect
-
-        savedMatrix.set(imageMatrix)
-
-        restoreAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 300
-            interpolator = decelerateInterpolator
-
-            addUpdateListener { animation ->
-                val fraction = animation.animatedFraction
-
-                // 动画还原裁剪框
-                cropRect.left =
-                    startCropRect.left + (endCropRect.left - startCropRect.left) * fraction
-                cropRect.top = startCropRect.top + (endCropRect.top - startCropRect.top) * fraction
-                cropRect.right =
-                    startCropRect.right + (endCropRect.right - startCropRect.right) * fraction
-                cropRect.bottom =
-                    startCropRect.bottom + (endCropRect.bottom - startCropRect.bottom) * fraction
-
-                // 动画缩放图片
-                val animScale = currentScale + (targetScale - currentScale) * fraction
-                // 动画平移图片
-                val animTranslateX =
-                    currentTranslate.x + (targetTranslateX - currentTranslate.x) * fraction
-                val animTranslateY =
-                    currentTranslate.y + (targetTranslateY - currentTranslate.y) * fraction
-
-                // 重建矩阵：scale -> rotate -> translate
-                imageMatrix.reset()
-                imageMatrix.postScale(animScale, animScale)
-
-                // 应用旋转
-                if (currentRotation != 0) {
-                    val scaledWidth = bitmap.width * animScale
-                    val scaledHeight = bitmap.height * animScale
-                    imageMatrix.postRotate(
-                        currentRotation.toFloat(),
-                        scaledWidth / 2,
-                        scaledHeight / 2
-                    )
-                }
-
-                imageMatrix.postTranslate(animTranslateX, animTranslateY)
-
-                calculateImageRect()
-                postInvalidateOnAnimation()
-            }
-
-            addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) {
-                    if (currentRatio > 0) {
-                        cropRect.set(originalCropRect)
-                    } else {
-                        cropRect.set(endCropRect)
-                    }
-                    calculateImageRect()
-                    checkAndFixBounds()
-                }
-            })
-        }.also { it.start() }
-    }
-
-    private fun checkAndFixBounds() {
-        val bitmap = sourceBitmap ?: return
-        calculateImageRect()
-
-        // 检查图片是否比裁剪框小，如果是则需要放大
-        val currentScale = getCurrentScale()
-        val (bmpWidth, bmpHeight) = getRotatedBitmapSize(bitmap)
-        val minScale = maxOf(
-            cropRect.width() / bmpWidth,
-            cropRect.height() / bmpHeight
-        )
-
-        if (currentScale < minScale) {
-            // 图片太小，放大到能覆盖裁剪框
-            val scale = minScale / currentScale
-            imageMatrix.postScale(scale, scale, cropRect.centerX(), cropRect.centerY())
-            calculateImageRect()
-        }
-
-        // 修正边界
-        fixTranslateBounds()
-    }
-
-    /**
-     * 只修正平移边界，不做缩放修正
-     * 用于缩放过程中，避免闪烁
-     */
-    private fun fixTranslateBounds() {
-        calculateImageRect()
-
-        var dx = 0f
-        var dy = 0f
-
-        if (imageRect.width() >= cropRect.width()) {
-            when {
-                imageRect.left > cropRect.left -> dx = cropRect.left - imageRect.left
-                imageRect.right < cropRect.right -> dx = cropRect.right - imageRect.right
-            }
-        } else {
-            // 图片宽度小于裁剪框，居中
-            dx = cropRect.centerX() - imageRect.centerX()
-        }
-
-        if (imageRect.height() >= cropRect.height()) {
-            when {
-                imageRect.top > cropRect.top -> dy = cropRect.top - imageRect.top
-                imageRect.bottom < cropRect.bottom -> dy = cropRect.bottom - imageRect.bottom
-            }
-        } else {
-            // 图片高度小于裁剪框，居中
-            dy = cropRect.centerY() - imageRect.centerY()
-        }
-
-        if (dx != 0f || dy != 0f) {
-            imageMatrix.postTranslate(dx, dy)
-            calculateImageRect()
-        }
-    }
-
-    private fun animateCheckBounds() {
-        val bitmap = sourceBitmap ?: return
-        calculateImageRect()
-
-        val currentScale = getCurrentScale()
-        val (bmpWidth, bmpHeight) = getRotatedBitmapSize(bitmap)
-        val minScale = maxOf(
-            cropRect.width() / bmpWidth,
-            cropRect.height() / bmpHeight
-        )
-
-        // 如果图片比裁剪框小，动画放大到覆盖裁剪框
-        if (currentScale < minScale) {
-            animateFitToCrop()
-            return
-        }
-
-        var dx = 0f
-        var dy = 0f
-        var needAnimate = false
-
-        // 图片宽度足够，检查左右边界
-        if (imageRect.width() >= cropRect.width()) {
-            when {
-                imageRect.left > cropRect.left -> {
-                    dx = cropRect.left - imageRect.left
-                    needAnimate = true
-                }
-
-                imageRect.right < cropRect.right -> {
-                    dx = cropRect.right - imageRect.right
-                    needAnimate = true
-                }
-            }
-        }
-
-        // 图片高度足够，检查上下边界
-        if (imageRect.height() >= cropRect.height()) {
-            when {
-                imageRect.top > cropRect.top -> {
-                    dy = cropRect.top - imageRect.top
-                    needAnimate = true
-                }
-
-                imageRect.bottom < cropRect.bottom -> {
-                    dy = cropRect.bottom - imageRect.bottom
-                    needAnimate = true
-                }
-            }
-        }
-
-        if (needAnimate && (dx != 0f || dy != 0f)) {
-            animateBounce(dx, dy)
-        } else {
-            postInvalidate()
-        }
-    }
-
-    private fun animateBounce(dx: Float, dy: Float) {
-        cancelAnimations()
-
-        savedMatrix.set(imageMatrix)
-
-        bounceAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 250
-            interpolator = decelerateInterpolator
-
-            addUpdateListener { animation ->
-                val fraction = animation.animatedFraction
-                val currentDx = dx * fraction
-                val currentDy = dy * fraction
-
-                imageMatrix.set(savedMatrix)
-                imageMatrix.postTranslate(currentDx, currentDy)
-                calculateImageRect()
-                postInvalidateOnAnimation()
-            }
-        }.also { it.start() }
-    }
-
-    // ==================== 绘制方法 ====================
+    // ==================== 绘制 ====================
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-
         val bitmap = sourceBitmap ?: return
 
-        // 绘制图片
-        canvas.save()
-        canvas.concat(imageMatrix)
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
-        canvas.restore()
+        canvas.withMatrix(imageMatrix) {
+            drawBitmap(bitmap, 0f, 0f, null)
+        }
 
-        // 绘制遮罩和裁剪框
         drawOverlay(canvas)
         drawCropBox(canvas)
-
-        // 绘制三分线网格
-        if (isShowingGuideLines) {
-            drawGuideLines(canvas)
-        }
+        if (isShowingGuideLines) drawGuideLines(canvas)
     }
 
     private fun drawOverlay(canvas: Canvas) {
         clipPath.reset()
-        clipPath.addRect(
-            cropRect.left,
-            cropRect.top,
-            cropRect.right,
-            cropRect.bottom,
-            Path.Direction.CW
-        )
-
-        canvas.save()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            canvas.clipOutPath(clipPath)
-        } else {
-            canvas.clipPath(clipPath, Region.Op.DIFFERENCE)
+        clipPath.addRect(cropRect, Path.Direction.CW)
+        canvas.withSave {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                clipOutPath(clipPath)
+            } else {
+                clipPath(clipPath, Region.Op.DIFFERENCE)
+            }
+            drawRect(0f, 0f, width.toFloat(), height.toFloat(), overlayPaint)
         }
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), overlayPaint)
-        canvas.restore()
     }
 
     private fun drawCropBox(canvas: Canvas) {
         canvas.drawRect(cropRect, cropBoxPaint)
 
-        val cornerLength = CORNER_LINE_LENGTH
+        val len = CORNER_LINE_LENGTH
+        val l = cropRect.left; val t = cropRect.top
+        val r = cropRect.right; val b = cropRect.bottom
 
-        // 四角标记
-        canvas.drawLine(
-            cropRect.left, cropRect.top,
-            cropRect.left + cornerLength, cropRect.top, cornerPaint
+        // 四角标记：(起点x, 起点y, 水平偏移, 垂直偏移) × 2条线
+        val corners = arrayOf(
+            floatArrayOf(l, t, len, 0f, 0f, len),   // 左上
+            floatArrayOf(r, t, -len, 0f, 0f, len),  // 右上
+            floatArrayOf(l, b, len, 0f, 0f, -len),   // 左下
+            floatArrayOf(r, b, -len, 0f, 0f, -len),  // 右下
         )
-        canvas.drawLine(
-            cropRect.left, cropRect.top,
-            cropRect.left, cropRect.top + cornerLength, cornerPaint
-        )
-
-        canvas.drawLine(
-            cropRect.right - cornerLength, cropRect.top,
-            cropRect.right, cropRect.top, cornerPaint
-        )
-        canvas.drawLine(
-            cropRect.right, cropRect.top,
-            cropRect.right, cropRect.top + cornerLength, cornerPaint
-        )
-
-        canvas.drawLine(
-            cropRect.left, cropRect.bottom - cornerLength,
-            cropRect.left, cropRect.bottom, cornerPaint
-        )
-        canvas.drawLine(
-            cropRect.left, cropRect.bottom,
-            cropRect.left + cornerLength, cropRect.bottom, cornerPaint
-        )
-
-        canvas.drawLine(
-            cropRect.right, cropRect.bottom - cornerLength,
-            cropRect.right, cropRect.bottom, cornerPaint
-        )
-        canvas.drawLine(
-            cropRect.right - cornerLength, cropRect.bottom,
-            cropRect.right, cropRect.bottom, cornerPaint
-        )
+        for (c in corners) {
+            canvas.drawLine(c[0], c[1], c[0] + c[2], c[1] + c[3], cornerPaint)
+            canvas.drawLine(c[0], c[1], c[0] + c[4], c[1] + c[5], cornerPaint)
+        }
     }
 
     private fun drawGuideLines(canvas: Canvas) {
-        val thirdWidth = cropRect.width() / 3f
-        val thirdHeight = cropRect.height() / 3f
-
+        val tw = cropRect.width() / 3f
+        val th = cropRect.height() / 3f
         for (i in 1..2) {
-            val x = cropRect.left + thirdWidth * i
+            val x = cropRect.left + tw * i
             canvas.drawLine(x, cropRect.top, x, cropRect.bottom, guideLinePaint)
         }
-
         for (i in 1..2) {
-            val y = cropRect.top + thirdHeight * i
+            val y = cropRect.top + th * i
             canvas.drawLine(cropRect.left, y, cropRect.right, y, guideLinePaint)
         }
     }
@@ -1477,44 +913,7 @@ class CropImageView @JvmOverloads constructor(
         super.onSizeChanged(w, h, oldw, oldh)
         if (w > 0 && h > 0) {
             calculateCropRect()
-            if (sourceBitmap != null) {
-                fitImageToCrop()
-            }
+            if (sourceBitmap != null) fitImageToCrop()
         }
-    }
-
-    fun getCroppedImage(): Bitmap? {
-        val bitmap = sourceBitmap ?: return null
-
-        val cropWidth = cropRect.width().toInt()
-        val cropHeight = cropRect.height().toInt()
-
-        if (cropWidth <= 0 || cropHeight <= 0) return null
-
-        // 创建结果 bitmap
-        val result = Bitmap.createBitmap(cropWidth, cropHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(result)
-
-        // 计算从裁剪框到视图的偏移
-        canvas.translate(-cropRect.left, -cropRect.top)
-
-        // 应用图片变换矩阵（绘制图片到裁剪框位置）
-        canvas.concat(imageMatrix)
-
-        // 绘制图片
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
-
-        return result
-    }
-
-    /**
-     * 重置裁剪框和图片
-     */
-    fun reset() {
-        currentScaleLevel = 0
-        currentRotation = 0
-        calculateCropRect()
-        fitImageToCrop()
-        invalidate()
     }
 }

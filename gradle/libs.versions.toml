@@ -11,7 +11,7 @@ composeBom = "2024.09.00"
 appcompat = "1.6.1"
 constraintLayout = "2.1.4"
 publish = "0.35.0"
-snip = "1.0.0"
+snip = "1.0.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }

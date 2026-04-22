@@ -53,7 +53,7 @@ class CropFragment : Fragment() {
             requireActivity().finish()
         }
         binding?.rotate?.setOnClickListener {
-            binding?.cropImageView?.rotate()
+            binding?.cropImageView?.rotate(-90f)
         }
         binding?.confirm?.setOnClickListener {
             crop()
@@ -68,7 +68,11 @@ class CropFragment : Fragment() {
         binding = null
     }
 
-    private fun loadImage(uri: Uri) {
+    private fun loadImage(uri: Uri?) {
+        if (uri == null) {
+            activity?.finish()
+            return
+        }
         val bitmap = loadBitmap(uri, requireContext())
         binding?.cropImageView?.setCropRatio(ratio)
         binding?.cropImageView?.setImageBitmap(bitmap)
