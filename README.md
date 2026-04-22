@@ -31,7 +31,7 @@
 在模块的 `build.gradle` 中添加依赖：
 
 ```groovy
-implementation 'io.github.shangmingchao:snip:1.0.0'
+implementation 'io.github.shangmingchao:snip:1.0.1'
 ```
 
 若使用 Gradle version catalog（`libs.versions.toml`）：
@@ -71,10 +71,10 @@ cropImageView.setImageBitmap(bitmap)
 cropImageView.setCropRatio(1f)
 
 // 旋转图片（顺时针）
-cropImageView.rotateClockwise()
+cropImageView.rotate(90f)
 
 // 旋转图片（逆时针）
-cropImageView.rotate()
+cropImageView.rotate(-90f)
 ```
 
 ### 4. 获取裁剪结果
