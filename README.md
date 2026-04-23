@@ -10,7 +10,7 @@
 
 ## ✨ 特性
 
-- 🖼️ **多种裁剪比例**：支持 1:1、16:9、9:16、4:3、3:4、自由比例（Free）以及任意自定义比例
+- 🖼️ **任意裁剪比例**：包括：1:1、16:9、9:16、4:3、3:4、自由比例
 - 👆 **单指拖拽**：拖动图片进行位置调整
 - ✌️ **双指缩放**：缩放图片，流畅平滑
 - 🔁 **双击缩放**：支持多级缩放，最多 5 次
@@ -38,7 +38,7 @@ implementation 'io.github.shangmingchao:snip:1.0.1'
 
 ```toml
 [versions]
-snip = "1.0.0"
+snip = "1.0.1"
 
 [libraries]
 snip = { group = "io.github.shangmingchao", name = "snip", version.ref = "snip" }
